@@ -1,0 +1,360 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════
+# compress — Video compressor CLI v3
+# Comprime videos manteniendo resolución y FPS originales
+# Estimación de tamaño + barra de progreso + ETA
+# ═══════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+PRESET="medium"; CRF=23; MAX_MB=0; SKIP_CONFIRM=false; FILES=()
+
+show_help() {
+  echo ""
+  echo -e "${BOLD}compress${NC} — Video compressor CLI v3"
+  echo ""
+  echo -e "${BOLD}USO:${NC}"
+  echo "  compress archivo.mov                    # preset medium (default)"
+  echo "  compress archivo.mov --fast             # más rápido"
+  echo "  compress archivo.mov --slow             # máxima compresión"
+  echo "  compress archivo.mov --max 500          # tope de 500MB"
+  echo "  compress *.mov --fast                   # batch processing"
+  echo "  compress archivo.mov -y                 # sin confirmación"
+  echo ""
+  echo -e "${BOLD}PRESETS:${NC}"
+  echo -e "  --ultrafast   Velocísimo, archivo más grande"
+  echo -e "  --fast        Rápido, buen balance"
+  echo -e "  --medium      ${DIM}(default)${NC} Balance óptimo"
+  echo -e "  --slow        Lento, máxima compresión"
+  echo ""
+  echo -e "${BOLD}OPCIONES:${NC}"
+  echo "  --max <MB>    Tamaño máximo en MB (activa two-pass)"
+  echo "  --crf <N>     CRF manual (18-28, default: 23)"
+  echo "  --yes, -y     Saltar confirmación"
+  echo "  --help        Muestra esta ayuda"
+  echo ""
+}
+
+print_sep() { echo -e "${DIM}──────────────────────────────────────────────────${NC}"; }
+
+fmt_size() {
+  local b=$1
+  if [ "$b" -gt 1073741824 ]; then echo "$(echo "scale=2; $b/1073741824" | bc) GB"
+  elif [ "$b" -gt 1048576 ]; then echo "$(echo "scale=1; $b/1048576" | bc) MB"
+  else echo "$(echo "scale=0; $b/1024" | bc) KB"; fi
+}
+
+fmt_time() {
+  local s=$1
+  if [ "$s" -ge 3600 ]; then printf "%dh %02dm %02ds" $((s/3600)) $((s%3600/60)) $((s%60))
+  elif [ "$s" -ge 60 ]; then printf "%dm %02ds" $((s/60)) $((s%60))
+  else printf "%ds" "$s"; fi
+}
+
+# ── Barra de progreso con ETA ──
+# Recibe: TOTAL_DURATION_SECS como $1, label como $2
+show_progress() {
+  local TOTAL_DUR=$1
+  local LABEL=${2:-"Encoding"}
+  local START_TS=$(date +%s)
+  local BAR_WIDTH=30
+
+  while IFS= read -r line; do
+    # Extraer time=HH:MM:SS.xx
+    local TIME_STR=$(echo "$line" | sed -n 's/.*time=\([0-9:.]*\).*/\1/p')
+    if [ -z "$TIME_STR" ]; then continue; fi
+
+    # Convertir HH:MM:SS.xx a segundos
+    local CURRENT_SECS=$(python3 -c "
+parts='$TIME_STR'.split(':')
+h,m=int(parts[0]),int(parts[1])
+s=float(parts[2])
+print(h*3600+m*60+s)" 2>/dev/null || echo "0")
+
+    # Porcentaje
+    local PCT=$(python3 -c "
+cur=$CURRENT_SECS; total=$TOTAL_DUR
+p=min(cur/total*100, 100) if total>0 else 0
+print(f'{p:.1f}')" 2>/dev/null)
+
+    local PCT_INT=$(echo "$PCT" | cut -d. -f1)
+    PCT_INT=${PCT_INT:-0}
+
+    # ETA
+    local NOW=$(date +%s)
+    local ELAPSED=$((NOW - START_TS))
+    local ETA_STR=""
+    if [ "$PCT_INT" -gt 2 ] && [ "$ELAPSED" -gt 3 ]; then
+      local ETA_SECS=$(python3 -c "
+elapsed=$ELAPSED; pct=$PCT
+if pct > 0:
+    remaining = elapsed * (100 - pct) / pct
+    print(int(remaining))
+else:
+    print(0)" 2>/dev/null)
+      ETA_STR=$(fmt_time "$ETA_SECS")
+    else
+      ETA_STR="calculando..."
+    fi
+
+    # Barra visual
+    local FILLED=$(( PCT_INT * BAR_WIDTH / 100 ))
+    local EMPTY=$(( BAR_WIDTH - FILLED ))
+    local BAR=""
+    for ((i=0; i<FILLED; i++)); do BAR+="█"; done
+    for ((i=0; i<EMPTY; i++)); do BAR+="░"; done
+
+    printf "\r  ${CYAN}${BAR}${NC} ${BOLD}%5s%%${NC}  ${DIM}ETA: %s${NC}   " "$PCT" "$ETA_STR"
+
+  done
+
+  # Línea final
+  local END_TS=$(date +%s)
+  local TOTAL_ELAPSED=$((END_TS - START_TS))
+  printf "\r  ${GREEN}$(printf '█%.0s' $(seq 1 $BAR_WIDTH))${NC} ${BOLD}100.0%%${NC}  ${DIM}$(fmt_time $TOTAL_ELAPSED)${NC}       \n"
+}
+
+# ── Parse args ──
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ultrafast) PRESET="ultrafast"; shift ;;
+    --fast)      PRESET="fast"; shift ;;
+    --medium)    PRESET="medium"; shift ;;
+    --slow)      PRESET="slow"; shift ;;
+    --max)       MAX_MB="$2"; shift 2 ;;
+    --crf)       CRF="$2"; shift 2 ;;
+    --yes|-y)    SKIP_CONFIRM=true; shift ;;
+    --help|-h)   show_help; exit 0 ;;
+    -*)          echo -e "${RED}Error: opción desconocida '$1'${NC}"; show_help; exit 1 ;;
+    *)           FILES+=("$1"); shift ;;
+  esac
+done
+
+if [ ${#FILES[@]} -eq 0 ]; then
+  echo -e "${RED}Error: no especificaste ningún archivo${NC}"; show_help; exit 1
+fi
+if ! command -v ffmpeg &>/dev/null; then
+  echo -e "${RED}Error: ffmpeg no instalado. brew install ffmpeg${NC}"; exit 1
+fi
+
+TOTAL_FILES=${#FILES[@]}; CURRENT=0; TOTAL_SAVED=0
+
+for INPUT in "${FILES[@]}"; do
+  CURRENT=$((CURRENT + 1))
+  echo ""
+  [ "$TOTAL_FILES" -gt 1 ] && echo -e "${BOLD}${CYAN}[$CURRENT/$TOTAL_FILES]${NC}"
+
+  if [ ! -f "$INPUT" ]; then
+    echo -e "${RED}✗ No encontrado: $INPUT${NC}"; continue
+  fi
+
+  # ── Metadata ──
+  PROBE=$(ffprobe -v error \
+    -show_entries format=duration,size,bit_rate \
+    -show_entries stream=codec_name,codec_type,width,height,r_frame_rate,bit_rate \
+    -of json "$INPUT" 2>/dev/null)
+
+  DURATION=$(echo "$PROBE" | python3 -c "import sys,json; print(json.load(sys.stdin)['format']['duration'])")
+  FILE_SIZE=$(echo "$PROBE" | python3 -c "import sys,json; print(json.load(sys.stdin)['format']['size'])")
+
+  V_WIDTH=$(echo "$PROBE" | python3 -c "
+import sys,json; s=json.load(sys.stdin)['streams']
+v=[x for x in s if x['codec_type']=='video']
+print(v[0]['width'] if v else 0)")
+
+  V_HEIGHT=$(echo "$PROBE" | python3 -c "
+import sys,json; s=json.load(sys.stdin)['streams']
+v=[x for x in s if x['codec_type']=='video']
+print(v[0]['height'] if v else 0)")
+
+  V_CODEC=$(echo "$PROBE" | python3 -c "
+import sys,json; s=json.load(sys.stdin)['streams']
+v=[x for x in s if x['codec_type']=='video']
+print(v[0]['codec_name'] if v else 'unknown')")
+
+  V_FPS_RAW=$(echo "$PROBE" | python3 -c "
+import sys,json; s=json.load(sys.stdin)['streams']
+v=[x for x in s if x['codec_type']=='video']
+print(v[0]['r_frame_rate'] if v else '0/1')")
+
+  V_FPS=$(python3 -c "n,d='$V_FPS_RAW'.split('/'); print(round(int(n)/int(d),2))")
+
+  V_BITRATE=$(echo "$PROBE" | python3 -c "
+import sys,json; s=json.load(sys.stdin)['streams']
+v=[x for x in s if x['codec_type']=='video']
+print(v[0].get('bit_rate','0') if v else '0')")
+
+  # ── Output path ──
+  DIR=$(dirname "$INPUT"); BASENAME=$(basename "$INPUT"); NAME="${BASENAME%.*}"
+  OUTPUT="$DIR/${NAME}_compressed.mp4"
+  if [ -f "$OUTPUT" ]; then
+    C=1; while [ -f "$DIR/${NAME}_compressed_${C}.mp4" ]; do C=$((C+1)); done
+    OUTPUT="$DIR/${NAME}_compressed_${C}.mp4"
+  fi
+
+  DURATION_INT=$(echo "$DURATION" | cut -d. -f1)
+  SIZE_HUMAN=$(fmt_size "$FILE_SIZE")
+  DUR_HUMAN=$(fmt_time "$DURATION_INT")
+  V_BR_HUMAN=$(echo "scale=1; ${V_BITRATE:-0}/1000000" | bc 2>/dev/null || echo "?")
+
+  print_sep
+  echo -e "${BOLD}📹 Input:${NC} $(basename "$INPUT")"
+  echo -e "   ${DIM}${V_WIDTH}x${V_HEIGHT} · ${V_FPS}fps · ${V_CODEC} · ${V_BR_HUMAN} Mbps${NC}"
+  echo -e "   ${DIM}${SIZE_HUMAN} · ${DUR_HUMAN}${NC}"
+  echo ""
+  echo -e "${BOLD}⚙️  Config:${NC} preset=${CYAN}${PRESET}${NC} · crf=${CYAN}${CRF}${NC}$([ "$MAX_MB" -gt 0 ] && echo " · max=${CYAN}${MAX_MB}MB${NC}")"
+  echo -e "${BOLD}📦 Output:${NC} $(basename "$OUTPUT")"
+  print_sep
+
+  # ── Estrategia ──
+  USE_TWO_PASS=false; TARGET_BITRATE=0
+  if [ "$MAX_MB" -gt 0 ]; then
+    TARGET_BITRATE=$(python3 -c "
+dur=$DURATION; vbps=int(($MAX_MB*1048576*8)/dur)-128000
+print(max(vbps//1000,500))")
+    [ "$TARGET_BITRATE" -lt 5000 ] && USE_TWO_PASS=true
+  fi
+
+  # ── Estimación ──
+  SAMPLE_SECS=30
+  [ "$DURATION_INT" -lt 60 ] && SAMPLE_SECS=$(( DURATION_INT / 2 ))
+  SAMPLE_START=$(python3 -c "print(int($DURATION/3))")
+  SAMPLE_FILE="/tmp/compress_sample_$$.mp4"
+
+  echo ""
+  echo -e "${DIM}🔍 Estimando tamaño final (muestra de ${SAMPLE_SECS}s)...${NC}"
+
+  if [ "$USE_TWO_PASS" = true ]; then
+    EST_SIZE=$(python3 -c "print(int(($TARGET_BITRATE*1000+128000)*$DURATION/8))")
+  else
+    ffmpeg -y -ss "$SAMPLE_START" -i "$INPUT" -t "$SAMPLE_SECS" \
+      -c:v libx265 -crf "$CRF" -preset ultrafast \
+      -vf "scale=${V_WIDTH}:${V_HEIGHT}" -r "$V_FPS" \
+      -c:a aac -b:a 128k -tag:v hvc1 \
+      "$SAMPLE_FILE" 2>/dev/null
+
+    if [ -f "$SAMPLE_FILE" ]; then
+      SAMPLE_SIZE=$(stat -f%z "$SAMPLE_FILE" 2>/dev/null || stat -c%s "$SAMPLE_FILE")
+      EST_SIZE=$(python3 -c "
+ss=$SAMPLE_SIZE; sd=$SAMPLE_SECS; td=$DURATION
+f={'ultrafast':1.0,'fast':0.85,'medium':0.78,'slow':0.72}.get('$PRESET',0.78)
+print(int((ss/sd)*td*f))")
+      rm -f "$SAMPLE_FILE"
+    else
+      EST_SIZE=0
+    fi
+  fi
+
+  if [ "$EST_SIZE" -gt 0 ]; then
+    EST_HUMAN=$(fmt_size "$EST_SIZE")
+    EST_RED=$(python3 -c "print(round((1-$EST_SIZE/$FILE_SIZE)*100,1))")
+    EST_SAVED_H=$(fmt_size "$(python3 -c "print(int($FILE_SIZE-$EST_SIZE))")")
+
+    echo ""
+    echo -e "${BOLD}📊 Estimación:${NC}"
+    echo -e "   ${DIM}Tamaño actual:${NC}   $SIZE_HUMAN"
+    echo -e "   ${DIM}Tamaño estimado:${NC} ${BOLD}${GREEN}~${EST_HUMAN}${NC}"
+    echo -e "   ${DIM}Ahorro estimado:${NC} ${GREEN}~${EST_SAVED_H} (-${EST_RED}%)${NC}"
+    [ "$USE_TWO_PASS" = true ] && echo -e "   ${DIM}Modo:${NC} two-pass (${TARGET_BITRATE}k)"
+
+    if [ "$MAX_MB" -gt 0 ]; then
+      EST_MB=$(python3 -c "print(round($EST_SIZE/1048576,1))")
+      if (( $(echo "$EST_MB > $MAX_MB" | bc -l) )); then
+        echo -e "   ${YELLOW}⚠ Podría exceder ${MAX_MB}MB${NC}"
+      else
+        echo -e "   ${GREEN}✓ Dentro del tope de ${MAX_MB}MB${NC}"
+      fi
+    fi
+  fi
+
+  if [ "$SKIP_CONFIRM" = false ]; then
+    echo ""
+    echo -ne "${BOLD}¿Continuar? [S/n]:${NC} "
+    read -r REPLY; REPLY=${REPLY:-S}
+    [[ ! "$REPLY" =~ ^[SsYy]$ ]] && echo -e "${YELLOW}⏭ Saltado${NC}" && continue
+  fi
+
+  echo ""
+  START_TIME=$(date +%s)
+
+  # ── Comprimir ──
+  if [ "$USE_TWO_PASS" = true ]; then
+    echo -e "${DIM}Pass 1/2${NC}"
+    ffmpeg -y -i "$INPUT" \
+      -c:v libx265 -b:v ${TARGET_BITRATE}k -preset "$PRESET" \
+      -vf "scale=${V_WIDTH}:${V_HEIGHT}" -r "$V_FPS" \
+      -x265-params "pass=1:stats=/tmp/compress_x265.log" \
+      -an -f null /dev/null 2>&1 | show_progress "$DURATION_INT" "Pass 1"
+
+    echo -e "${DIM}Pass 2/2${NC}"
+    ffmpeg -y -i "$INPUT" \
+      -c:v libx265 -b:v ${TARGET_BITRATE}k -preset "$PRESET" \
+      -vf "scale=${V_WIDTH}:${V_HEIGHT}" -r "$V_FPS" \
+      -x265-params "pass=2:stats=/tmp/compress_x265.log" \
+      -c:a aac -b:a 128k -tag:v hvc1 -movflags +faststart \
+      "$OUTPUT" 2>&1 | show_progress "$DURATION_INT" "Pass 2"
+    rm -f /tmp/compress_x265.log /tmp/compress_x265.log.cutree
+
+  else
+    ffmpeg -y -i "$INPUT" \
+      -c:v libx265 -crf "$CRF" -preset "$PRESET" \
+      -vf "scale=${V_WIDTH}:${V_HEIGHT}" -r "$V_FPS" \
+      -c:a aac -b:a 128k -tag:v hvc1 -movflags +faststart \
+      "$OUTPUT" 2>&1 | show_progress "$DURATION_INT"
+  fi
+
+  END_TIME=$(date +%s); ELAPSED=$((END_TIME - START_TIME))
+
+  if [ ! -f "$OUTPUT" ]; then
+    echo -e "${RED}✗ Error: no se generó el archivo${NC}"; continue
+  fi
+
+  # ── Resultado ──
+  OUT_SIZE=$(stat -f%z "$OUTPUT" 2>/dev/null || stat -c%s "$OUTPUT")
+  OUT_PROBE=$(ffprobe -v error -show_entries format=bit_rate -of json "$OUTPUT" 2>/dev/null)
+  OUT_SIZE_HUMAN=$(fmt_size "$OUT_SIZE")
+  REDUCTION=$(python3 -c "print(round((1-$OUT_SIZE/$FILE_SIZE)*100,1))")
+  SAVED_BYTES=$((FILE_SIZE - OUT_SIZE))
+  SAVED_HUMAN=$(fmt_size "$SAVED_BYTES")
+  TOTAL_SAVED=$((TOTAL_SAVED + SAVED_BYTES))
+
+  OUT_BR=$(echo "$OUT_PROBE" | python3 -c "
+import sys,json; print(json.load(sys.stdin)['format'].get('bit_rate','0'))" 2>/dev/null)
+  OUT_BR_HUMAN=$(echo "scale=1; ${OUT_BR:-0}/1000000" | bc 2>/dev/null || echo "?")
+
+  EST_ACC=""
+  if [ "$EST_SIZE" -gt 0 ]; then
+    EST_ACC=$(python3 -c "print(f'{100-abs($EST_SIZE-$OUT_SIZE)/$OUT_SIZE*100:.1f}')")
+  fi
+
+  echo ""
+  echo -e "${GREEN}${BOLD}✓ Compresión exitosa${NC}"
+  print_sep
+  echo -e "  ${DIM}Antes:${NC}     $SIZE_HUMAN  (${V_BR_HUMAN} Mbps)"
+  echo -e "  ${DIM}Después:${NC}   ${BOLD}$OUT_SIZE_HUMAN${NC}  (${OUT_BR_HUMAN} Mbps)"
+  echo -e "  ${DIM}Ahorro:${NC}    ${GREEN}${SAVED_HUMAN} (-${REDUCTION}%)${NC}"
+  echo -e "  ${DIM}Tiempo:${NC}    $(fmt_time $ELAPSED)"
+  [ -n "$EST_ACC" ] && echo -e "  ${DIM}Precisión:${NC} ${EST_ACC}% vs estimación"
+  echo -e "  ${DIM}Output:${NC}    $OUTPUT"
+
+  if [ "$MAX_MB" -gt 0 ]; then
+    OUT_MB=$(python3 -c "print(round($OUT_SIZE/1048576,1))")
+    if (( $(echo "$OUT_MB > $MAX_MB" | bc -l) )); then
+      echo -e "  ${YELLOW}⚠ Excede ${MAX_MB}MB (${OUT_MB}MB). Prueba --slow o --crf $((CRF+2))${NC}"
+    else
+      echo -e "  ${GREEN}✓ Dentro del tope de ${MAX_MB}MB${NC}"
+    fi
+  fi
+  print_sep
+
+done
+
+if [ "$TOTAL_FILES" -gt 1 ]; then
+  echo ""
+  echo -e "${BOLD}${GREEN}═══ Batch completado: $TOTAL_FILES archivos ═══${NC}"
+  echo -e "  Ahorro total: ${GREEN}$(fmt_size $TOTAL_SAVED)${NC}"
+  echo ""
+fi
