@@ -1,8 +1,8 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-# compress — Video compressor CLI v3
+# compress — Video compressor CLI v4
 # Comprime videos manteniendo resolución y FPS originales
-# Estimación de tamaño + barra de progreso + ETA
+# Multi-sample estimation + real-time progress bar
 # ═══════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -14,7 +14,7 @@ PRESET="medium"; CRF=23; MAX_MB=0; SKIP_CONFIRM=false; FILES=()
 
 show_help() {
   echo ""
-  echo -e "${BOLD}compress${NC} — Video compressor CLI v3"
+  echo -e "${BOLD}compress${NC} — Video compressor CLI v4"
   echo ""
   echo -e "${BOLD}USO:${NC}"
   echo "  compress archivo.mov                    # preset medium (default)"
@@ -54,67 +54,62 @@ fmt_time() {
   else printf "%ds" "$s"; fi
 }
 
-# ── Barra de progreso con ETA ──
-# Recibe: TOTAL_DURATION_SECS como $1, label como $2
+# ── Real-time progress bar using -progress pipe:1 ──
 show_progress() {
   local TOTAL_DUR=$1
-  local LABEL=${2:-"Encoding"}
   local START_TS=$(date +%s)
   local BAR_WIDTH=30
 
-  while IFS= read -r line; do
-    # Extraer time=HH:MM:SS.xx
-    local TIME_STR=$(echo "$line" | sed -n 's/.*time=\([0-9:.]*\).*/\1/p')
-    if [ -z "$TIME_STR" ]; then continue; fi
+  while IFS='=' read -r key value; do
+    # -progress outputs key=value pairs, we want out_time
+    if [ "$key" = "out_time" ]; then
+      # value = HH:MM:SS.ffffff
+      local CURRENT_SECS=$(python3 -c "
+parts='$value'.strip().split(':')
+if len(parts)==3:
+    h,m=int(parts[0]),int(parts[1])
+    s=float(parts[2])
+    print(max(0, h*3600+m*60+s))
+else:
+    print(0)" 2>/dev/null || echo "0")
 
-    # Convertir HH:MM:SS.xx a segundos
-    local CURRENT_SECS=$(python3 -c "
-parts='$TIME_STR'.split(':')
-h,m=int(parts[0]),int(parts[1])
-s=float(parts[2])
-print(h*3600+m*60+s)" 2>/dev/null || echo "0")
-
-    # Porcentaje
-    local PCT=$(python3 -c "
+      local PCT=$(python3 -c "
 cur=$CURRENT_SECS; total=$TOTAL_DUR
-p=min(cur/total*100, 100) if total>0 else 0
+p=min(cur/total*100,100) if total>0 else 0
 print(f'{p:.1f}')" 2>/dev/null)
 
-    local PCT_INT=$(echo "$PCT" | cut -d. -f1)
-    PCT_INT=${PCT_INT:-0}
+      local PCT_INT=$(echo "$PCT" | cut -d. -f1)
+      PCT_INT=${PCT_INT:-0}
 
-    # ETA
-    local NOW=$(date +%s)
-    local ELAPSED=$((NOW - START_TS))
-    local ETA_STR=""
-    if [ "$PCT_INT" -gt 2 ] && [ "$ELAPSED" -gt 3 ]; then
-      local ETA_SECS=$(python3 -c "
+      local NOW=$(date +%s)
+      local ELAPSED=$((NOW - START_TS))
+      local ETA_STR=""
+
+      if [ "$PCT_INT" -gt 2 ] && [ "$ELAPSED" -gt 3 ]; then
+        local ETA_SECS=$(python3 -c "
 elapsed=$ELAPSED; pct=$PCT
-if pct > 0:
-    remaining = elapsed * (100 - pct) / pct
-    print(int(remaining))
-else:
-    print(0)" 2>/dev/null)
-      ETA_STR=$(fmt_time "$ETA_SECS")
-    else
-      ETA_STR="calculando..."
+remaining=int(elapsed*(100-pct)/pct) if pct>0 else 0
+print(remaining)" 2>/dev/null)
+        ETA_STR=$(fmt_time "$ETA_SECS")
+      else
+        ETA_STR="calculando..."
+      fi
+
+      local FILLED=$(( PCT_INT * BAR_WIDTH / 100 ))
+      local EMPTY=$(( BAR_WIDTH - FILLED ))
+      local BAR=""
+      for ((i=0; i<FILLED; i++)); do BAR+="█"; done
+      for ((i=0; i<EMPTY; i++)); do BAR+="░"; done
+
+      printf "\r  ${CYAN}${BAR}${NC} ${BOLD}%5s%%${NC}  ${DIM}ETA: %-15s${NC}" "$PCT" "$ETA_STR"
     fi
-
-    # Barra visual
-    local FILLED=$(( PCT_INT * BAR_WIDTH / 100 ))
-    local EMPTY=$(( BAR_WIDTH - FILLED ))
-    local BAR=""
-    for ((i=0; i<FILLED; i++)); do BAR+="█"; done
-    for ((i=0; i<EMPTY; i++)); do BAR+="░"; done
-
-    printf "\r  ${CYAN}${BAR}${NC} ${BOLD}%5s%%${NC}  ${DIM}ETA: %s${NC}   " "$PCT" "$ETA_STR"
-
   done
 
-  # Línea final
   local END_TS=$(date +%s)
   local TOTAL_ELAPSED=$((END_TS - START_TS))
-  printf "\r  ${GREEN}$(printf '█%.0s' $(seq 1 $BAR_WIDTH))${NC} ${BOLD}100.0%%${NC}  ${DIM}$(fmt_time $TOTAL_ELAPSED)${NC}       \n"
+  printf "\r  ${GREEN}"
+  for ((i=0; i<BAR_WIDTH; i++)); do printf "█"; done
+  printf "${NC} ${BOLD}100.0%%${NC}  ${DIM}$(fmt_time $TOTAL_ELAPSED)${NC}       \n"
 }
 
 # ── Parse args ──
@@ -218,31 +213,61 @@ print(max(vbps//1000,500))")
     [ "$TARGET_BITRATE" -lt 5000 ] && USE_TWO_PASS=true
   fi
 
-  # ── Estimación ──
-  SAMPLE_SECS=30
-  [ "$DURATION_INT" -lt 60 ] && SAMPLE_SECS=$(( DURATION_INT / 2 ))
-  SAMPLE_START=$(python3 -c "print(int($DURATION/3))")
-  SAMPLE_FILE="/tmp/compress_sample_$$.mp4"
+  # ════════════════════════════════════════════════════════════
+  # ── ESTIMACIÓN: 3 muestras de 10s desde distintos puntos ──
+  # ════════════════════════════════════════════════════════════
+  SAMPLE_DUR=10
+  if [ "$DURATION_INT" -lt 40 ]; then
+    SAMPLE_DUR=$(( DURATION_INT / 4 ))
+    [ "$SAMPLE_DUR" -lt 3 ] && SAMPLE_DUR=3
+  fi
+
+  # 3 puntos: 20%, 50%, 80% del video
+  POS1=$(python3 -c "print(int($DURATION * 0.20))")
+  POS2=$(python3 -c "print(int($DURATION * 0.50))")
+  POS3=$(python3 -c "print(int($DURATION * 0.80))")
 
   echo ""
-  echo -e "${DIM}🔍 Estimando tamaño final (muestra de ${SAMPLE_SECS}s)...${NC}"
+  echo -e "${DIM}🔍 Estimando tamaño (3 muestras × ${SAMPLE_DUR}s)...${NC}"
 
   if [ "$USE_TWO_PASS" = true ]; then
     EST_SIZE=$(python3 -c "print(int(($TARGET_BITRATE*1000+128000)*$DURATION/8))")
   else
-    ffmpeg -y -ss "$SAMPLE_START" -i "$INPUT" -t "$SAMPLE_SECS" \
-      -c:v libx265 -crf "$CRF" -preset ultrafast \
-      -vf "scale=${V_WIDTH}:${V_HEIGHT}" -r "$V_FPS" \
-      -c:a aac -b:a 128k -tag:v hvc1 \
-      "$SAMPLE_FILE" 2>/dev/null
+    TOTAL_SAMPLE_BYTES=0
+    TOTAL_SAMPLE_SECS=0
+    SAMPLE_OK=0
 
-    if [ -f "$SAMPLE_FILE" ]; then
-      SAMPLE_SIZE=$(stat -f%z "$SAMPLE_FILE" 2>/dev/null || stat -c%s "$SAMPLE_FILE")
+    for POS in $POS1 $POS2 $POS3; do
+      SFILE="/tmp/compress_sample_${$}_${POS}.mp4"
+      ffmpeg -y -ss "$POS" -i "$INPUT" -t "$SAMPLE_DUR" \
+        -c:v libx265 -crf "$CRF" -preset ultrafast \
+        -vf "scale=${V_WIDTH}:${V_HEIGHT}" -r "$V_FPS" \
+        -c:a aac -b:a 128k -tag:v hvc1 \
+        "$SFILE" 2>/dev/null
+
+      if [ -f "$SFILE" ]; then
+        SBYTES=$(stat -f%z "$SFILE" 2>/dev/null || stat -c%s "$SFILE")
+        TOTAL_SAMPLE_BYTES=$((TOTAL_SAMPLE_BYTES + SBYTES))
+        TOTAL_SAMPLE_SECS=$((TOTAL_SAMPLE_SECS + SAMPLE_DUR))
+        SAMPLE_OK=$((SAMPLE_OK + 1))
+        rm -f "$SFILE"
+      fi
+    done
+
+    if [ "$SAMPLE_OK" -gt 0 ] && [ "$TOTAL_SAMPLE_SECS" -gt 0 ]; then
       EST_SIZE=$(python3 -c "
-ss=$SAMPLE_SIZE; sd=$SAMPLE_SECS; td=$DURATION
-f={'ultrafast':1.0,'fast':0.85,'medium':0.78,'slow':0.72}.get('$PRESET',0.78)
-print(int((ss/sd)*td*f))")
-      rm -f "$SAMPLE_FILE"
+total_bytes=$TOTAL_SAMPLE_BYTES
+sample_secs=$TOTAL_SAMPLE_SECS
+total_dur=$DURATION
+preset='$PRESET'
+# Factor ajustado: ultrafast es menos eficiente que otros presets
+# Con CRF, ultrafast genera archivos más grandes
+# Estos factores representan: preset_size / ultrafast_size
+factors = {'ultrafast': 1.0, 'fast': 0.90, 'medium': 0.82, 'slow': 0.75}
+factor = factors.get(preset, 0.82)
+bps = total_bytes / sample_secs
+estimated = bps * total_dur * factor
+print(int(estimated))")
     else
       EST_SIZE=0
     fi
@@ -280,14 +305,16 @@ print(int((ss/sd)*td*f))")
   echo ""
   START_TIME=$(date +%s)
 
-  # ── Comprimir ──
+  # ── Comprimir con progress pipe ──
   if [ "$USE_TWO_PASS" = true ]; then
     echo -e "${DIM}Pass 1/2${NC}"
     ffmpeg -y -i "$INPUT" \
       -c:v libx265 -b:v ${TARGET_BITRATE}k -preset "$PRESET" \
       -vf "scale=${V_WIDTH}:${V_HEIGHT}" -r "$V_FPS" \
       -x265-params "pass=1:stats=/tmp/compress_x265.log" \
-      -an -f null /dev/null 2>&1 | show_progress "$DURATION_INT" "Pass 1"
+      -an -f null \
+      -progress pipe:1 \
+      /dev/null 2>/dev/null | show_progress "$DURATION_INT"
 
     echo -e "${DIM}Pass 2/2${NC}"
     ffmpeg -y -i "$INPUT" \
@@ -295,7 +322,8 @@ print(int((ss/sd)*td*f))")
       -vf "scale=${V_WIDTH}:${V_HEIGHT}" -r "$V_FPS" \
       -x265-params "pass=2:stats=/tmp/compress_x265.log" \
       -c:a aac -b:a 128k -tag:v hvc1 -movflags +faststart \
-      "$OUTPUT" 2>&1 | show_progress "$DURATION_INT" "Pass 2"
+      -progress pipe:1 \
+      "$OUTPUT" 2>/dev/null | show_progress "$DURATION_INT"
     rm -f /tmp/compress_x265.log /tmp/compress_x265.log.cutree
 
   else
@@ -303,7 +331,8 @@ print(int((ss/sd)*td*f))")
       -c:v libx265 -crf "$CRF" -preset "$PRESET" \
       -vf "scale=${V_WIDTH}:${V_HEIGHT}" -r "$V_FPS" \
       -c:a aac -b:a 128k -tag:v hvc1 -movflags +faststart \
-      "$OUTPUT" 2>&1 | show_progress "$DURATION_INT"
+      -progress pipe:1 \
+      "$OUTPUT" 2>/dev/null | show_progress "$DURATION_INT"
   fi
 
   END_TIME=$(date +%s); ELAPSED=$((END_TIME - START_TIME))
