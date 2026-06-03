@@ -1,8 +1,8 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-# compress — Video compressor CLI v4
-# Comprime videos manteniendo resolución y FPS originales
-# Multi-sample estimation + real-time progress bar
+# compress — Video compressor CLI v5
+# Interactive preset selection + real-time progress
+# Always preserves original resolution and FPS
 # ═══════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -10,24 +10,22 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
-PRESET="medium"; CRF=23; MAX_MB=0; SKIP_CONFIRM=false; FILES=()
+PRESET=""; CRF=23; MAX_MB=0; SKIP_CONFIRM=false; INTERACTIVE=true; FILES=()
 
 show_help() {
   echo ""
-  echo -e "${BOLD}compress${NC} — Video compressor CLI v4"
+  echo -e "${BOLD}compress${NC} — Video compressor CLI v5"
   echo ""
   echo -e "${BOLD}USO:${NC}"
-  echo "  compress archivo.mov                    # preset medium (default)"
-  echo "  compress archivo.mov --fast             # más rápido"
-  echo "  compress archivo.mov --slow             # máxima compresión"
-  echo "  compress archivo.mov --max 500          # tope de 500MB"
-  echo "  compress *.mov --fast                   # batch processing"
-  echo "  compress archivo.mov -y                 # sin confirmación"
+  echo "  compress archivo.mov                    # modo interactivo"
+  echo "  compress archivo.mov --fast             # directo, sin menú"
+  echo "  compress archivo.mov --fast --max 500   # directo con tope"
+  echo "  compress *.mov --fast -y                # batch sin preguntas"
   echo ""
   echo -e "${BOLD}PRESETS:${NC}"
   echo -e "  --ultrafast   Velocísimo, archivo más grande"
   echo -e "  --fast        Rápido, buen balance"
-  echo -e "  --medium      ${DIM}(default)${NC} Balance óptimo"
+  echo -e "  --medium      Balance óptimo"
   echo -e "  --slow        Lento, máxima compresión"
   echo ""
   echo -e "${BOLD}OPCIONES:${NC}"
@@ -35,6 +33,9 @@ show_help() {
   echo "  --crf <N>     CRF manual (18-28, default: 23)"
   echo "  --yes, -y     Saltar confirmación"
   echo "  --help        Muestra esta ayuda"
+  echo ""
+  echo -e "${DIM}Sin flags → modo interactivo con menú de opciones${NC}"
+  echo -e "${DIM}Con flags → modo directo (ideal para batch)${NC}"
   echo ""
 }
 
@@ -54,24 +55,37 @@ fmt_time() {
   else printf "%ds" "$s"; fi
 }
 
-# ── Real-time progress bar using -progress pipe:1 ──
+# ── Estimar tiempo de encoding ──
+est_encode_time() {
+  local dur=$1 preset=$2 codec=$3
+  # Speeds aprox en x-realtime para M-series, H.264 source
+  # H.265 source encodea ~30% más rápido
+  python3 -c "
+dur=$dur
+preset='$preset'
+codec='$codec'
+speeds = {'ultrafast': 3.5, 'fast': 1.0, 'medium': 0.5, 'slow': 0.2}
+spd = speeds.get(preset, 0.5)
+if codec == 'hevc': spd *= 1.3
+secs = int(dur / spd)
+print(secs)"
+}
+
+# ── Real-time progress bar ──
 show_progress() {
   local TOTAL_DUR=$1
   local START_TS=$(date +%s)
   local BAR_WIDTH=30
 
   while IFS='=' read -r key value; do
-    # -progress outputs key=value pairs, we want out_time
     if [ "$key" = "out_time" ]; then
-      # value = HH:MM:SS.ffffff
       local CURRENT_SECS=$(python3 -c "
 parts='$value'.strip().split(':')
 if len(parts)==3:
     h,m=int(parts[0]),int(parts[1])
     s=float(parts[2])
-    print(max(0, h*3600+m*60+s))
-else:
-    print(0)" 2>/dev/null || echo "0")
+    print(max(0,h*3600+m*60+s))
+else: print(0)" 2>/dev/null || echo "0")
 
       local PCT=$(python3 -c "
 cur=$CURRENT_SECS; total=$TOTAL_DUR
@@ -115,11 +129,11 @@ print(remaining)" 2>/dev/null)
 # ── Parse args ──
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ultrafast) PRESET="ultrafast"; shift ;;
-    --fast)      PRESET="fast"; shift ;;
-    --medium)    PRESET="medium"; shift ;;
-    --slow)      PRESET="slow"; shift ;;
-    --max)       MAX_MB="$2"; shift 2 ;;
+    --ultrafast) PRESET="ultrafast"; INTERACTIVE=false; shift ;;
+    --fast)      PRESET="fast"; INTERACTIVE=false; shift ;;
+    --medium)    PRESET="medium"; INTERACTIVE=false; shift ;;
+    --slow)      PRESET="slow"; INTERACTIVE=false; shift ;;
+    --max)       MAX_MB="$2"; INTERACTIVE=false; shift 2 ;;
     --crf)       CRF="$2"; shift 2 ;;
     --yes|-y)    SKIP_CONFIRM=true; shift ;;
     --help|-h)   show_help; exit 0 ;;
@@ -182,6 +196,99 @@ import sys,json; s=json.load(sys.stdin)['streams']
 v=[x for x in s if x['codec_type']=='video']
 print(v[0].get('bit_rate','0') if v else '0')")
 
+  DURATION_INT=$(echo "$DURATION" | cut -d. -f1)
+  SIZE_HUMAN=$(fmt_size "$FILE_SIZE")
+  DUR_HUMAN=$(fmt_time "$DURATION_INT")
+  V_BR_HUMAN=$(echo "scale=1; ${V_BITRATE:-0}/1000000" | bc 2>/dev/null || echo "?")
+
+  # ── Video info ──
+  print_sep
+  echo -e "${BOLD}📹 Input:${NC} $(basename "$INPUT")"
+  echo -e "   ${DIM}${V_WIDTH}x${V_HEIGHT} · ${V_FPS}fps · ${V_CODEC} · ${V_BR_HUMAN} Mbps${NC}"
+  echo -e "   ${DIM}${SIZE_HUMAN} · ${DUR_HUMAN}${NC}"
+  echo -e "   ${DIM}Calidad preservada: ${V_WIDTH}x${V_HEIGHT} · ${V_FPS}fps${NC}"
+  print_sep
+
+  # ════════════════════════════════════════════════
+  # ── MENÚ INTERACTIVO (si no pasaron flags) ──
+  # ════════════════════════════════════════════════
+  if [ "$INTERACTIVE" = true ]; then
+
+    # Estimar tiempos para cada preset
+    T_UF=$(est_encode_time "$DURATION_INT" "ultrafast" "$V_CODEC")
+    T_FA=$(est_encode_time "$DURATION_INT" "fast" "$V_CODEC")
+    T_ME=$(est_encode_time "$DURATION_INT" "medium" "$V_CODEC")
+    T_SL=$(est_encode_time "$DURATION_INT" "slow" "$V_CODEC")
+
+    echo ""
+    echo -e "${BOLD}⚡ Velocidad:${NC}"
+    echo -e "   ${CYAN}1)${NC} ultrafast   ⚡⚡⚡⚡  ~$(fmt_time $T_UF)   ${DIM}archivo más grande${NC}"
+    echo -e "   ${CYAN}2)${NC} fast        ⚡⚡⚡    ~$(fmt_time $T_FA)   ${DIM}buen balance${NC}"
+    echo -e "   ${CYAN}3)${NC} medium      ⚡⚡      ~$(fmt_time $T_ME)   ${DIM}balance óptimo${NC}"
+    echo -e "   ${CYAN}4)${NC} slow        ⚡        ~$(fmt_time $T_SL)   ${DIM}máxima compresión${NC}"
+    echo ""
+    echo -ne "   ${BOLD}Elige [1-4]${NC} ${DIM}(Enter = 2 fast):${NC} "
+    read -r SPEED_CHOICE
+    SPEED_CHOICE=${SPEED_CHOICE:-2}
+
+    case "$SPEED_CHOICE" in
+      1) PRESET="ultrafast" ;;
+      2) PRESET="fast" ;;
+      3) PRESET="medium" ;;
+      4) PRESET="slow" ;;
+      *) PRESET="fast"; echo -e "   ${DIM}→ fast${NC}" ;;
+    esac
+
+    echo ""
+    echo -e "${BOLD}📏 Tamaño máximo:${NC}"
+    echo -e "   ${CYAN}1)${NC} Sin límite          ${DIM}CRF 23, tamaño variable${NC}"
+    echo -e "   ${CYAN}2)${NC} Máx 500 MB          ${DIM}ideal para compartir${NC}"
+    echo -e "   ${CYAN}3)${NC} Máx 400 MB          ${DIM}más compacto${NC}"
+    echo -e "   ${CYAN}4)${NC} Máx 300 MB          ${DIM}agresivo${NC}"
+    echo -e "   ${CYAN}5)${NC} Custom              ${DIM}ingresa tu tope${NC}"
+    echo ""
+    echo -ne "   ${BOLD}Elige [1-5]${NC} ${DIM}(Enter = 1):${NC} "
+    read -r SIZE_CHOICE
+    SIZE_CHOICE=${SIZE_CHOICE:-1}
+
+    case "$SIZE_CHOICE" in
+      1) MAX_MB=0 ;;
+      2) MAX_MB=500 ;;
+      3) MAX_MB=400 ;;
+      4) MAX_MB=300 ;;
+      5)
+        echo -ne "   ${BOLD}Tamaño máximo en MB:${NC} "
+        read -r CUSTOM_MB
+        MAX_MB=${CUSTOM_MB:-0}
+        ;;
+      *) MAX_MB=0 ;;
+    esac
+
+    echo ""
+    echo -e "${BOLD}🎨 Calidad (CRF):${NC}"
+    echo -e "   ${CYAN}1)${NC} Alta        CRF 20  ${DIM}casi lossless, archivo grande${NC}"
+    echo -e "   ${CYAN}2)${NC} Muy buena   CRF 22  ${DIM}excelente calidad${NC}"
+    echo -e "   ${CYAN}3)${NC} Buena       CRF 23  ${DIM}recomendado${NC}"
+    echo -e "   ${CYAN}4)${NC} Eficiente   CRF 25  ${DIM}buena calidad, más compacto${NC}"
+    echo -e "   ${CYAN}5)${NC} Compacta    CRF 28  ${DIM}aceptable, muy liviano${NC}"
+    echo ""
+    echo -ne "   ${BOLD}Elige [1-5]${NC} ${DIM}(Enter = 3):${NC} "
+    read -r CRF_CHOICE
+    CRF_CHOICE=${CRF_CHOICE:-3}
+
+    case "$CRF_CHOICE" in
+      1) CRF=20 ;;
+      2) CRF=22 ;;
+      3) CRF=23 ;;
+      4) CRF=25 ;;
+      5) CRF=28 ;;
+      *) CRF=23 ;;
+    esac
+  fi
+
+  # Default preset si aún está vacío
+  [ -z "$PRESET" ] && PRESET="medium"
+
   # ── Output path ──
   DIR=$(dirname "$INPUT"); BASENAME=$(basename "$INPUT"); NAME="${BASENAME%.*}"
   OUTPUT="$DIR/${NAME}_compressed.mp4"
@@ -190,18 +297,20 @@ print(v[0].get('bit_rate','0') if v else '0')")
     OUTPUT="$DIR/${NAME}_compressed_${C}.mp4"
   fi
 
-  DURATION_INT=$(echo "$DURATION" | cut -d. -f1)
-  SIZE_HUMAN=$(fmt_size "$FILE_SIZE")
-  DUR_HUMAN=$(fmt_time "$DURATION_INT")
-  V_BR_HUMAN=$(echo "scale=1; ${V_BITRATE:-0}/1000000" | bc 2>/dev/null || echo "?")
-
-  print_sep
-  echo -e "${BOLD}📹 Input:${NC} $(basename "$INPUT")"
-  echo -e "   ${DIM}${V_WIDTH}x${V_HEIGHT} · ${V_FPS}fps · ${V_CODEC} · ${V_BR_HUMAN} Mbps${NC}"
-  echo -e "   ${DIM}${SIZE_HUMAN} · ${DUR_HUMAN}${NC}"
+  # ── Resumen de configuración ──
   echo ""
-  echo -e "${BOLD}⚙️  Config:${NC} preset=${CYAN}${PRESET}${NC} · crf=${CYAN}${CRF}${NC}$([ "$MAX_MB" -gt 0 ] && echo " · max=${CYAN}${MAX_MB}MB${NC}")"
-  echo -e "${BOLD}📦 Output:${NC} $(basename "$OUTPUT")"
+  print_sep
+  echo -e "${BOLD}🔧 Configuración final:${NC}"
+  echo -e "   ${DIM}Velocidad:${NC}  ${CYAN}${PRESET}${NC}"
+  echo -e "   ${DIM}Calidad:${NC}    CRF ${CYAN}${CRF}${NC}"
+  if [ "$MAX_MB" -gt 0 ]; then
+    echo -e "   ${DIM}Tope:${NC}       ${CYAN}${MAX_MB} MB${NC} (two-pass)"
+  else
+    echo -e "   ${DIM}Tope:${NC}       sin límite"
+  fi
+  echo -e "   ${DIM}Resolución:${NC} ${GREEN}${V_WIDTH}x${V_HEIGHT}${NC} ${DIM}(preservada)${NC}"
+  echo -e "   ${DIM}FPS:${NC}        ${GREEN}${V_FPS}${NC} ${DIM}(preservado)${NC}"
+  echo -e "   ${DIM}Output:${NC}     $(basename "$OUTPUT")"
   print_sep
 
   # ── Estrategia ──
@@ -213,16 +322,13 @@ print(max(vbps//1000,500))")
     [ "$TARGET_BITRATE" -lt 5000 ] && USE_TWO_PASS=true
   fi
 
-  # ════════════════════════════════════════════════════════════
-  # ── ESTIMACIÓN: 3 muestras de 10s desde distintos puntos ──
-  # ════════════════════════════════════════════════════════════
+  # ── Estimación: 3 muestras ──
   SAMPLE_DUR=10
   if [ "$DURATION_INT" -lt 40 ]; then
     SAMPLE_DUR=$(( DURATION_INT / 4 ))
     [ "$SAMPLE_DUR" -lt 3 ] && SAMPLE_DUR=3
   fi
 
-  # 3 puntos: 20%, 50%, 80% del video
   POS1=$(python3 -c "print(int($DURATION * 0.20))")
   POS2=$(python3 -c "print(int($DURATION * 0.50))")
   POS3=$(python3 -c "print(int($DURATION * 0.80))")
@@ -233,12 +339,10 @@ print(max(vbps//1000,500))")
   if [ "$USE_TWO_PASS" = true ]; then
     EST_SIZE=$(python3 -c "print(int(($TARGET_BITRATE*1000+128000)*$DURATION/8))")
   else
-    TOTAL_SAMPLE_BYTES=0
-    TOTAL_SAMPLE_SECS=0
-    SAMPLE_OK=0
+    TOTAL_SAMPLE_BYTES=0; TOTAL_SAMPLE_SECS=0; SAMPLE_OK=0
 
     for POS in $POS1 $POS2 $POS3; do
-      SFILE="/tmp/compress_sample_${$}_${POS}.mp4"
+      SFILE="/tmp/compress_s_${$}_${POS}.mp4"
       ffmpeg -y -ss "$POS" -i "$INPUT" -t "$SAMPLE_DUR" \
         -c:v libx265 -crf "$CRF" -preset ultrafast \
         -vf "scale=${V_WIDTH}:${V_HEIGHT}" -r "$V_FPS" \
@@ -260,13 +364,10 @@ total_bytes=$TOTAL_SAMPLE_BYTES
 sample_secs=$TOTAL_SAMPLE_SECS
 total_dur=$DURATION
 preset='$PRESET'
-# Factor ajustado: ultrafast es menos eficiente que otros presets
-# Con CRF, ultrafast genera archivos más grandes
-# Estos factores representan: preset_size / ultrafast_size
-factors = {'ultrafast': 1.0, 'fast': 0.90, 'medium': 0.82, 'slow': 0.75}
-factor = factors.get(preset, 0.82)
-bps = total_bytes / sample_secs
-estimated = bps * total_dur * factor
+factors={'ultrafast':1.0,'fast':0.90,'medium':0.82,'slow':0.75}
+factor=factors.get(preset,0.82)
+bps=total_bytes/sample_secs
+estimated=bps*total_dur*factor
 print(int(estimated))")
     else
       EST_SIZE=0
@@ -288,7 +389,11 @@ print(int(estimated))")
     if [ "$MAX_MB" -gt 0 ]; then
       EST_MB=$(python3 -c "print(round($EST_SIZE/1048576,1))")
       if (( $(echo "$EST_MB > $MAX_MB" | bc -l) )); then
-        echo -e "   ${YELLOW}⚠ Podría exceder ${MAX_MB}MB${NC}"
+        echo -e "   ${YELLOW}⚠ Podría exceder ${MAX_MB}MB — se usará two-pass para garantizar${NC}"
+        USE_TWO_PASS=true
+        TARGET_BITRATE=$(python3 -c "
+dur=$DURATION; vbps=int(($MAX_MB*1048576*8)/dur)-128000
+print(max(vbps//1000,500))")
       else
         echo -e "   ${GREEN}✓ Dentro del tope de ${MAX_MB}MB${NC}"
       fi
@@ -297,7 +402,7 @@ print(int(estimated))")
 
   if [ "$SKIP_CONFIRM" = false ]; then
     echo ""
-    echo -ne "${BOLD}¿Continuar? [S/n]:${NC} "
+    echo -ne "${BOLD}¿Iniciar compresión? [S/n]:${NC} "
     read -r REPLY; REPLY=${REPLY:-S}
     [[ ! "$REPLY" =~ ^[SsYy]$ ]] && echo -e "${YELLOW}⏭ Saltado${NC}" && continue
   fi
@@ -305,7 +410,7 @@ print(int(estimated))")
   echo ""
   START_TIME=$(date +%s)
 
-  # ── Comprimir con progress pipe ──
+  # ── Comprimir ──
   if [ "$USE_TWO_PASS" = true ]; then
     echo -e "${DIM}Pass 1/2${NC}"
     ffmpeg -y -i "$INPUT" \
@@ -354,6 +459,15 @@ print(int(estimated))")
 import sys,json; print(json.load(sys.stdin)['format'].get('bit_rate','0'))" 2>/dev/null)
   OUT_BR_HUMAN=$(echo "scale=1; ${OUT_BR:-0}/1000000" | bc 2>/dev/null || echo "?")
 
+  # Verificar resolución y FPS del output
+  OUT_CHECK=$(ffprobe -v error \
+    -show_entries stream=width,height,r_frame_rate \
+    -select_streams v:0 -of json "$OUTPUT" 2>/dev/null)
+  OUT_W=$(echo "$OUT_CHECK" | python3 -c "import sys,json; print(json.load(sys.stdin)['streams'][0]['width'])" 2>/dev/null)
+  OUT_H=$(echo "$OUT_CHECK" | python3 -c "import sys,json; print(json.load(sys.stdin)['streams'][0]['height'])" 2>/dev/null)
+  OUT_FPS_RAW=$(echo "$OUT_CHECK" | python3 -c "import sys,json; print(json.load(sys.stdin)['streams'][0]['r_frame_rate'])" 2>/dev/null)
+  OUT_FPS=$(python3 -c "n,d='$OUT_FPS_RAW'.split('/'); print(round(int(n)/int(d),2))" 2>/dev/null)
+
   EST_ACC=""
   if [ "$EST_SIZE" -gt 0 ]; then
     EST_ACC=$(python3 -c "print(f'{100-abs($EST_SIZE-$OUT_SIZE)/$OUT_SIZE*100:.1f}')")
@@ -362,12 +476,14 @@ import sys,json; print(json.load(sys.stdin)['format'].get('bit_rate','0'))" 2>/d
   echo ""
   echo -e "${GREEN}${BOLD}✓ Compresión exitosa${NC}"
   print_sep
-  echo -e "  ${DIM}Antes:${NC}     $SIZE_HUMAN  (${V_BR_HUMAN} Mbps)"
-  echo -e "  ${DIM}Después:${NC}   ${BOLD}$OUT_SIZE_HUMAN${NC}  (${OUT_BR_HUMAN} Mbps)"
-  echo -e "  ${DIM}Ahorro:${NC}    ${GREEN}${SAVED_HUMAN} (-${REDUCTION}%)${NC}"
-  echo -e "  ${DIM}Tiempo:${NC}    $(fmt_time $ELAPSED)"
-  [ -n "$EST_ACC" ] && echo -e "  ${DIM}Precisión:${NC} ${EST_ACC}% vs estimación"
-  echo -e "  ${DIM}Output:${NC}    $OUTPUT"
+  echo -e "  ${DIM}Antes:${NC}      $SIZE_HUMAN  (${V_BR_HUMAN} Mbps)"
+  echo -e "  ${DIM}Después:${NC}    ${BOLD}$OUT_SIZE_HUMAN${NC}  (${OUT_BR_HUMAN} Mbps)"
+  echo -e "  ${DIM}Ahorro:${NC}     ${GREEN}${SAVED_HUMAN} (-${REDUCTION}%)${NC}"
+  echo -e "  ${DIM}Tiempo:${NC}     $(fmt_time $ELAPSED)"
+  [ -n "$EST_ACC" ] && echo -e "  ${DIM}Precisión:${NC}  ${EST_ACC}% vs estimación"
+  echo -e "  ${DIM}Resolución:${NC} ${GREEN}${OUT_W}x${OUT_H}${NC} ✓"
+  echo -e "  ${DIM}FPS:${NC}        ${GREEN}${OUT_FPS}${NC} ✓"
+  echo -e "  ${DIM}Output:${NC}     $OUTPUT"
 
   if [ "$MAX_MB" -gt 0 ]; then
     OUT_MB=$(python3 -c "print(round($OUT_SIZE/1048576,1))")
